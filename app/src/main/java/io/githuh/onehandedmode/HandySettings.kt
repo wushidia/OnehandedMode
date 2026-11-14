@@ -9,6 +9,8 @@ object HandySettings {
     const val PRESET = "preset_percent"
     const val CUSTOM = "custom_percent"
     const val KEEP_NAVIGATION_GESTURES = "keep_navigation_gestures"
+    const val BLUR_WALLPAPER = "blur_wallpaper"
+    const val SAVE_SCALE_ACTION = "io.githuh.onehandedmode.action.SAVE_SCALE"
     const val PRESET_MODE = 0
     const val CUSTOM_MODE = 1
     const val DEFAULT_PERCENT = 70

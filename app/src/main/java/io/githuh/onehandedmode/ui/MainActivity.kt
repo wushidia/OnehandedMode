@@ -11,7 +11,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.Saver
@@ -76,7 +75,7 @@ class MainActivity : ComponentActivity() {
                     entry<Page>(swipeDismiss = NavSwipeDirection.LeftToRight) { current ->
                         when (current) {
                             Page.About -> AboutScreen(onBack)
-                            Page.Help -> HelpScreen(onBack)
+                            Page.Help -> TutorialScreen(onBack)
                             Page.Home -> HomeScreen(
                                 preferences = preferences,
                                 supported = systemSupported,
@@ -135,12 +134,16 @@ private fun HomeScreen(
     var keepNavigationGestures by remember(preferences) {
         mutableStateOf(preferences?.getBoolean(HandySettings.KEEP_NAVIGATION_GESTURES, false) ?: false)
     }
+    var blurWallpaper by remember(preferences) {
+        mutableStateOf(preferences?.getBoolean(HandySettings.BLUR_WALLPAPER, false) ?: false)
+    }
     DisposableEffect(preferences) {
         val listener = SharedPreferences.OnSharedPreferenceChangeListener { prefs, _ ->
             mode = prefs.getInt(HandySettings.MODE, 0)
             preset = prefs.getInt(HandySettings.PRESET, HandySettings.DEFAULT_PERCENT)
             custom = prefs.getInt(HandySettings.CUSTOM, HandySettings.DEFAULT_PERCENT)
             keepNavigationGestures = prefs.getBoolean(HandySettings.KEEP_NAVIGATION_GESTURES, false)
+            blurWallpaper = prefs.getBoolean(HandySettings.BLUR_WALLPAPER, false)
         }
         preferences?.registerOnSharedPreferenceChangeListener(listener)
         onDispose { preferences?.unregisterOnSharedPreferenceChangeListener(listener) }
@@ -203,6 +206,17 @@ private fun HomeScreen(
         item { Spacer(Modifier.height(12.dp)) }
         item {
             Card(Modifier.fillMaxWidth()) {
+                SwitchPreference(
+                    title = stringResource(R.string.blur_wallpaper),
+                    summary = stringResource(R.string.blur_wallpaper_summary),
+                    checked = blurWallpaper,
+                    onCheckedChange = { checked ->
+                        blurWallpaper = checked
+                        preferences!!.edit().putBoolean(HandySettings.BLUR_WALLPAPER, checked).apply()
+                    },
+                    insideMargin = PreferencePadding,
+                    enabled = preferences != null,
+                )
                 SwitchPreference(
                     title = stringResource(R.string.keep_navigation_gestures),
                     summary = stringResource(R.string.keep_navigation_gestures_summary),
@@ -327,28 +341,4 @@ internal fun BackButton(onBack: () -> Unit) {
 @Composable
 internal fun SectionTitle(text: String) {
     SmallTitle(text = text, insideMargin = PaddingValues(horizontal = ContentInset, vertical = 8.dp))
-}
-
-@Composable
-private fun HelpScreen(onBack: () -> Unit) {
-    val sections = listOf(
-        R.string.help_enter to R.string.help_enter_body,
-        R.string.help_exit to R.string.help_exit_body,
-        R.string.help_scale to R.string.help_scale_body,
-        R.string.help_external to R.string.help_external_body,
-    )
-    SettingsScaffold(title = stringResource(R.string.help), onBack = onBack) {
-        sections.forEach { (title, body) ->
-            item { SectionTitle(stringResource(title)) }
-            item {
-                Card(Modifier.fillMaxWidth()) {
-                    SelectionContainer(Modifier.fillMaxWidth()) {
-                        Text(stringResource(body), modifier = Modifier.padding(ContentInset),
-                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary, fontSize = 15.sp, lineHeight = 24.sp)
-                    }
-                }
-            }
-        }
-        item { Spacer(Modifier.height(24.dp).navigationBarsPadding()) }
-    }
 }

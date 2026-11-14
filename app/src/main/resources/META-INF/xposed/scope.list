@@ -2,3 +2,5 @@ android
 system
 com.android.systemui
 com.coloros.smartsidebar
+com.android.launcher3
+com.google.android.apps.nexuslauncher

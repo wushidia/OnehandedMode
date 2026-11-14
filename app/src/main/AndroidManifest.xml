@@ -13,6 +13,10 @@
         android:localeConfig="@xml/locales_config"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
+        <receiver
+            android:name=".ScaleReceiver"
+            android:exported="true"
+            android:permission="android.permission.STATUS_BAR" />
         <activity
             android:name=".ui.MainActivity"
             android:exported="true">

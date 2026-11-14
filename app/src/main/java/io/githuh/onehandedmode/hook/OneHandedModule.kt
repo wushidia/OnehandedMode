@@ -31,6 +31,7 @@ class OneHandedModule : XposedModule() {
     @Volatile private var hasOplusSidebar = false
     private var systemUiHooksInstalled = false
     private var platformSupportInstalled = false
+    private lateinit var navigation: HandyNavigation
 
     override fun onModuleLoaded(param: ModuleLoadedParam) {
         log(Log.INFO, "OneHandedMode", "Module loaded: version=${BuildConfig.VERSION_NAME}(${BuildConfig.VERSION_CODE}), " +
@@ -62,6 +63,11 @@ class OneHandedModule : XposedModule() {
     }
 
     override fun onPackageReady(param: PackageReadyParam) {
+        if (param.isFirstPackage && param.packageName in taskbarPackages &&
+            Application.getProcessName() == param.packageName) {
+            AospTaskbarNavigation(this, param.classLoader).install()
+            return
+        }
         if (param.isFirstPackage && param.packageName == "com.coloros.smartsidebar" &&
             OplusFreeformCoexist.isSidebarAvailable(param.classLoader)) {
             runCatching {
@@ -75,6 +81,7 @@ class OneHandedModule : XposedModule() {
         log(Log.INFO, "OneHandedMode", "SystemUI package ready: process=$process, firstPackage=${param.isFirstPackage}")
         if (process != "com.android.systemui") return
         systemUiHooksInstalled = true
+        navigation = HandyNavigation()
         enablePlatformSupport()
 
         val loader = param.classLoader
@@ -103,7 +110,7 @@ class OneHandedModule : XposedModule() {
             deoptimize(constructor)
             hook(constructor).intercept { chain ->
                 val result = chain.proceed()
-                runtime = HandyRuntime(chain.thisObject!!, preferences) { screenshotBackgroundParent }
+                runtime = HandyRuntime(chain.thisObject!!, preferences, navigation) { screenshotBackgroundParent }
                 runtime.attach()
                 val instance = chain.thisObject!!
                 val handler = instance.read("mMainHandler") as Handler
@@ -231,6 +238,7 @@ class OneHandedModule : XposedModule() {
             result
         }
         log(Log.INFO, "OneHandedMode", "Hooks installed at framework and callback boundaries")
+        navigation.install(this, loader)
         NavigationGestureMode(this, loader, preferences).install()
         log(Log.INFO, "OneHandedMode", "Navigation gesture hooks installed")
     }

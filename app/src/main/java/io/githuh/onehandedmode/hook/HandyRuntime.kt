@@ -1,6 +1,9 @@
 package io.githuh.onehandedmode.hook
 
 import android.annotation.SuppressLint
+import android.animation.ValueAnimator
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
 import android.app.KeyguardManager
 import android.app.ActivityManager
 import android.content.BroadcastReceiver
@@ -12,12 +15,14 @@ import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.PointF
 import android.graphics.Matrix
+import android.graphics.Rect
 import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Handler
 import android.os.SystemClock
 import android.provider.Settings
 import android.view.Display
+import android.view.Choreographer
 import android.view.MotionEvent
 import android.view.RoundedCorner
 import android.view.Surface
@@ -31,6 +36,7 @@ import kotlin.math.roundToInt
 internal class HandyRuntime(
     private val controller: Any,
     private val preferences: SharedPreferences,
+    private val navigation: HandyNavigation,
     private val backgroundParent: () -> SurfaceControl?,
 ) : DisplayManager.DisplayListener {
     private val context = controller.read("mContext") as Context
@@ -38,7 +44,7 @@ internal class HandyRuntime(
     private val organizer = controller.read("mDisplayAreaOrganizer")!!
     private val display = context.getSystemService(DisplayManager::class.java).getDisplay(Display.DEFAULT_DISPLAY)
     private var screen = ScreenSpec.read(display)
-    private val overlay = HandySurround(context, handler, ::requestExit, ::openSettings)
+    private val overlay = HandySurround(context, handler, ::requestExit, ::openSettings, ::switchSide, ::resize)
     private val background = HandyBackground()
     private val stateField = controller.read("mState")!!.javaClass
         .getDeclaredField("sCurrentState").apply { isAccessible = true }
@@ -51,7 +57,15 @@ internal class HandyRuntime(
     private var restartAt = 0L
     private var entryTime = 0L
     private var lastSurroundOffset = Float.NaN
+    private var lastSurroundX = Float.NaN
     private var cornerRadius = 0f
+    private var anchor = 1f
+    private var sideAnimator: ValueAnimator? = null
+    private var pendingScale = scale
+    private var resizeFramePosted = false
+    private var resizeFinished = false
+    private val resizeFrame = Choreographer.FrameCallback { applyResize() }
+    private var blurWallpaper = preferences.getBoolean(HandySettings.BLUR_WALLPAPER, false)
     private lateinit var hiddenBarGesture: XiaomiHiddenBarGesture
 
     private val matrix = SurfaceControl.Transaction::class.java.getDeclaredMethod(
@@ -65,6 +79,10 @@ internal class HandyRuntime(
     private val windowCrop = SurfaceControl.Transaction::class.java.getDeclaredMethod(
         "setWindowCrop", SurfaceControl::class.java, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType,
     )
+    private val frameTimeline = SurfaceControl.Transaction::class.java.getDeclaredMethod(
+        "setFrameTimelineVsync", Long::class.javaPrimitiveType,
+    )
+    private val frameVsync = Choreographer::class.java.getDeclaredMethod("getVsyncId")
     private val preferenceListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
         handler.post { applySettings() }
     }
@@ -84,6 +102,7 @@ internal class HandyRuntime(
     }
 
     fun attach() {
+        navigation.attach(context)
         // The organizer is fully initialized here, including in R8-inlined factories.
         organizer.write("mEnterExitAnimationDurationMs", 200)
         val callbackType = Class.forName(
@@ -124,14 +143,30 @@ internal class HandyRuntime(
 
     private fun applySettings() {
         val newScale = HandySettings.scale(preferences)
-        if (newScale != scale && state != 0) {
-            // MIUI refreshStatus exits, then re-enters after 300 ms when size changes.
-            resizePending = true
-            restartAt = SystemClock.uptimeMillis() + 300L
-            requestExit()
+        if (newScale != scale) {
+            scale = newScale
+            if (state == 2) {
+                applyGeometry()
+                overlay.update(scale, right)
+            } else if (state == 1) {
+                resizePending = true
+                restartAt = SystemClock.uptimeMillis() + 300L
+                requestExit()
+            }
         }
-        scale = newScale
         controller.write("mOffSetFraction", 1f - scale)
+        val newBlur = preferences.getBoolean(HandySettings.BLUR_WALLPAPER, false)
+        if (newBlur != blurWallpaper) {
+            blurWallpaper = newBlur
+            if (state == 2) {
+                background.hide()
+                prepareBackground()
+                SurfaceControl.Transaction().use { tx ->
+                    background.apply(tx)
+                    tx.apply()
+                }
+            }
+        }
         val resolver = context.contentResolver
         val user = controller.read("mUserId") as Int
         val get = Settings.Secure::class.java.getDeclaredMethod(
@@ -176,6 +211,7 @@ internal class HandyRuntime(
         scale = HandySettings.scale(preferences)
         controller.write("mOffSetFraction", 1f - scale)
         right = downX >= screen.width / 2f
+        anchor = if (right) 1f else 0f
         return true
     }
 
@@ -195,7 +231,7 @@ internal class HandyRuntime(
 
     fun mapFreeformInput(event: MotionEvent) {
         val visualScale = 1f - lastSurroundOffset / screen.height
-        val x = if (right) screen.width * (1f - visualScale) else 0f
+        val x = screen.width * (1f - visualScale) * anchor
         val inverse = Matrix().apply {
             setValues(floatArrayOf(
                 1f / visualScale, 0f, -x / visualScale,
@@ -208,7 +244,7 @@ internal class HandyRuntime(
 
     fun freeformPointToDisplay(x: Float, y: Float): PointF {
         val visualScale = 1f - lastSurroundOffset / screen.height
-        val offset = if (right) screen.width * (1f - visualScale) else 0f
+        val offset = screen.width * (1f - visualScale) * anchor
         return PointF(x * visualScale + offset, y * visualScale + lastSurroundOffset)
     }
 
@@ -238,8 +274,7 @@ internal class HandyRuntime(
             1 -> {
                 lastSurroundOffset = Float.NaN
                 entryTime = SystemClock.elapsedRealtime()
-                val color = backgroundColor()
-                background.prepare(screen, color, backgroundParent())
+                prepareBackground()
                 overlay.show(screen, scale, right)
                 publishMode(if (right) 2 else 1)
             }
@@ -250,11 +285,20 @@ internal class HandyRuntime(
                     handler.post { requestExit() }
                 }
             }
-            3 -> overlay.onExitStarted()
+            3 -> {
+                sideAnimator?.cancel()
+                if (resizeFramePosted) {
+                    Choreographer.getInstance().removeFrameCallback(resizeFrame)
+                    resizeFramePosted = false
+                }
+                resizeFinished = false
+                overlay.onExitStarted()
+            }
             0 -> {
                 exitPending = false
                 background.hide()
                 overlay.hide()
+                navigation.reset()
                 publishMode(0)
                 if (resizePending) {
                     resizePending = false
@@ -265,6 +309,82 @@ internal class HandyRuntime(
                 }
             }
         }
+    }
+
+    private fun prepareBackground() {
+        background.prepare(context, screen, backgroundColor(), backgroundParent(), blurWallpaper)
+    }
+
+    private fun switchSide() {
+        if (state != 2 || sideAnimator?.isRunning == true) return
+        right = !right
+        sideAnimator = ValueAnimator.ofFloat(anchor, if (right) 1f else 0f).apply {
+            duration = 200L
+            interpolator = android.animation.TimeInterpolator { OneHandedModule.circularEaseOut(it) }
+            addUpdateListener {
+                anchor = it.animatedValue as Float
+                applyGeometry()
+            }
+            addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    if (state == 2) {
+                        overlay.update(scale, right)
+                        publishMode(if (right) 2 else 1)
+                    }
+                }
+            })
+            start()
+        }
+    }
+
+    private fun resize(newScale: Float, finished: Boolean) {
+        if (state != 2 || sideAnimator?.isRunning == true) return
+        pendingScale = newScale
+        resizeFinished = resizeFinished || finished
+        if (!resizeFramePosted) {
+            resizeFramePosted = true
+            Choreographer.getInstance().postFrameCallback(resizeFrame)
+        }
+    }
+
+    private fun applyResize() {
+        resizeFramePosted = false
+        if (state != 2) return
+        val finished = resizeFinished
+        resizeFinished = false
+        val percent = (pendingScale * 100).roundToInt()
+        val newScale = if (finished) percent / 100f else pendingScale
+        if (newScale != scale) {
+            scale = newScale
+            controller.write("mOffSetFraction", 1f - scale)
+            applyGeometry(frameVsync.invoke(Choreographer.getInstance()) as Long)
+        }
+        if (finished) {
+            // Keep the input windows stable throughout the drag; relayout once on release.
+            overlay.update(scale, right)
+            context.sendBroadcast(Intent(HandySettings.SAVE_SCALE_ACTION)
+                .setClassName("io.githuh.onehandedmode", "io.githuh.onehandedmode.ScaleReceiver")
+                .addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
+                .putExtra(HandySettings.CUSTOM, percent))
+        }
+    }
+
+    private fun applyGeometry(vsync: Long? = null) {
+        val offset = (screen.height * (1f - scale)).roundToInt().toFloat()
+        val leashes = organizer.read("mDisplayAreaTokenMap") as Map<*, *>
+        SurfaceControl.Transaction().use { tx ->
+            if (vsync != null) frameTimeline.invoke(tx, vsync)
+            leashes.values.forEach {
+                val leash = it as SurfaceControl
+                val point = transform(tx, leash, offset)
+                tx.setPosition(leash, point.x, point.y)
+            }
+            tx.apply()
+        }
+        organizer.write("mLastVisualOffset", offset)
+        val bounds = organizer.read("mLastVisualDisplayBounds") as Rect
+        bounds.offsetTo(0, offset.toInt())
+        (controller.read("mTouchHandler")!!.read("mLastUpdatedBounds") as Rect).set(bounds)
     }
 
     private fun publishMode(mode: Int) {
@@ -292,14 +412,21 @@ internal class HandyRuntime(
     fun transform(tx: SurfaceControl.Transaction, leash: SurfaceControl, offset: Float): PointF {
         val y = offset
         val currentScale = 1f - y / screen.height
-        val x = if (right) screen.width * (1f - currentScale) else 0f
+        val x = screen.width * (1f - currentScale) * anchor
         background.apply(tx)
         matrix.invoke(tx, leash, currentScale, 0f, 0f, currentScale)
         windowCrop.invoke(tx, leash, screen.width, screen.height)
         // SurfaceFlinger scales this local radius with the same matrix as the content.
         corner.invoke(tx, leash, cornerRadius)
-        if (y != lastSurroundOffset) {
+        if (y != lastSurroundOffset || x != lastSurroundX) {
             lastSurroundOffset = y
+            lastSurroundX = x
+            navigation.update(currentScale, x)
+            if (state == 1 || state == 2) {
+                val gap = screen.width * (1f - currentScale)
+                overlay.moveSettings(screen.width * (1f - anchor) + gap * (anchor - .5f),
+                    screen.height - gap / 2f)
+            }
         }
         return PointF(x, y)
     }
