@@ -63,7 +63,7 @@ internal class HandyRuntime(
     private var sideAnimator: ValueAnimator? = null
     private var pendingScale = scale
     private var resizeFramePosted = false
-    private var resizeFinished = false
+    private var resizing = false
     private val resizeFrame = Choreographer.FrameCallback { applyResize() }
     private var blurWallpaper = preferences.getBoolean(HandySettings.BLUR_WALLPAPER, false)
     private lateinit var hiddenBarGesture: XiaomiHiddenBarGesture
@@ -83,8 +83,8 @@ internal class HandyRuntime(
         "setFrameTimelineVsync", Long::class.javaPrimitiveType,
     )
     private val frameVsync = Choreographer::class.java.getDeclaredMethod("getVsyncId")
-    private val preferenceListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
-        handler.post { applySettings() }
+    private val preferenceListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        handler.post { applySettings(key) }
     }
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -141,17 +141,22 @@ internal class HandyRuntime(
         handler.post { applySettings() }
     }
 
-    private fun applySettings() {
-        val newScale = HandySettings.scale(preferences)
-        if (newScale != scale) {
-            scale = newScale
-            if (state == 2) {
-                applyGeometry()
-                overlay.update(scale, right)
-            } else if (state == 1) {
-                resizePending = true
-                restartAt = SystemClock.uptimeMillis() + 300L
-                requestExit()
+    private fun applySettings(changedKey: String? = null) {
+        val sizeKey = if (preferences.getInt(HandySettings.MODE, HandySettings.PRESET_MODE) == HandySettings.CUSTOM_MODE)
+            HandySettings.CUSTOM else HandySettings.PRESET
+        // A drag owns the live size. Unrelated preference changes must not restore an older size.
+        if (!resizing && (changedKey == null || changedKey == HandySettings.MODE || changedKey == sizeKey)) {
+            val newScale = HandySettings.scale(preferences)
+            if (newScale != scale) {
+                scale = newScale
+                if (state == 2) {
+                    applyGeometry()
+                    overlay.update(scale, right)
+                } else if (state == 1) {
+                    resizePending = true
+                    restartAt = SystemClock.uptimeMillis() + 300L
+                    requestExit()
+                }
             }
         }
         controller.write("mOffSetFraction", 1f - scale)
@@ -208,7 +213,7 @@ internal class HandyRuntime(
             RoundedCorner.POSITION_TOP_LEFT, RoundedCorner.POSITION_TOP_RIGHT,
             RoundedCorner.POSITION_BOTTOM_LEFT, RoundedCorner.POSITION_BOTTOM_RIGHT,
         ).minOf { display.getRoundedCorner(it)?.radius ?: 0 }.toFloat()
-        scale = HandySettings.scale(preferences)
+        // Every entry route uses the live size, including while its save broadcast is in flight.
         controller.write("mOffSetFraction", 1f - scale)
         right = downX >= screen.width / 2f
         anchor = if (right) 1f else 0f
@@ -287,14 +292,11 @@ internal class HandyRuntime(
             }
             3 -> {
                 sideAnimator?.cancel()
-                if (resizeFramePosted) {
-                    Choreographer.getInstance().removeFrameCallback(resizeFrame)
-                    resizeFramePosted = false
-                }
-                resizeFinished = false
+                if (resizing) finishResize(updateWindow = false) else cancelResizeFrame()
                 overlay.onExitStarted()
             }
             0 -> {
+                if (resizing) finishResize(updateWindow = false) else cancelResizeFrame()
                 exitPending = false
                 background.hide()
                 overlay.hide()
@@ -340,8 +342,10 @@ internal class HandyRuntime(
     private fun resize(newScale: Float, finished: Boolean) {
         if (state != 2 || sideAnimator?.isRunning == true) return
         pendingScale = newScale
-        resizeFinished = resizeFinished || finished
-        if (!resizeFramePosted) {
+        resizing = true
+        if (finished) {
+            finishResize(updateWindow = true)
+        } else if (!resizeFramePosted) {
             resizeFramePosted = true
             Choreographer.getInstance().postFrameCallback(resizeFrame)
         }
@@ -350,23 +354,38 @@ internal class HandyRuntime(
     private fun applyResize() {
         resizeFramePosted = false
         if (state != 2) return
-        val finished = resizeFinished
-        resizeFinished = false
-        val percent = (pendingScale * 100).roundToInt()
-        val newScale = if (finished) percent / 100f else pendingScale
-        if (newScale != scale) {
-            scale = newScale
+        if (pendingScale != scale) {
+            scale = pendingScale
             controller.write("mOffSetFraction", 1f - scale)
             applyGeometry(frameVsync.invoke(Choreographer.getInstance()) as Long)
         }
-        if (finished) {
-            // Keep the input windows stable throughout the drag; relayout once on release.
-            overlay.update(scale, right)
-            context.sendBroadcast(Intent(HandySettings.SAVE_SCALE_ACTION)
-                .setClassName("io.githuh.onehandedmode", "io.githuh.onehandedmode.ScaleReceiver")
-                .addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
-                .putExtra(HandySettings.CUSTOM, percent))
+    }
+
+    private fun cancelResizeFrame() {
+        if (resizeFramePosted) {
+            Choreographer.getInstance().removeFrameCallback(resizeFrame)
+            resizeFramePosted = false
         }
+    }
+
+    private fun finishResize(updateWindow: Boolean) {
+        cancelResizeFrame()
+        resizing = false
+        val percent = (pendingScale * 100).roundToInt()
+        val newScale = percent / 100f
+        if (newScale != scale) {
+            scale = newScale
+            controller.write("mOffSetFraction", 1f - scale)
+            if (updateWindow) applyGeometry()
+        }
+        // Saving is gesture completion work, not a frame callback that an exit can cancel.
+        if (updateWindow) {
+            overlay.update(scale, right)
+        }
+        context.sendBroadcast(Intent(HandySettings.SAVE_SCALE_ACTION)
+            .setClassName("io.githuh.onehandedmode", "io.githuh.onehandedmode.ScaleReceiver")
+            .addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
+            .putExtra(HandySettings.CUSTOM, percent))
     }
 
     private fun applyGeometry(vsync: Long? = null) {

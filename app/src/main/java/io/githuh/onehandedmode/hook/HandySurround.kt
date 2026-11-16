@@ -201,12 +201,14 @@ internal class HandySurround(
         private var startX = 0f
         private var startY = 0f
         private var startScale = 1f
+        private var lastResizeScale = 1f
         private var gesture = 0
         private var sideGesture = false
 
         private fun resize(event: MotionEvent, finished: Boolean) {
             val scale = (startScale - (event.rawY - startY) / this@HandySurround.height)
                 .coerceIn(HandySettings.MIN_PERCENT / 100f, HandySettings.MAX_PERCENT / 100f)
+            lastResizeScale = scale
             shellHandler.post { onResize(scale, finished) }
         }
 
@@ -258,7 +260,10 @@ internal class HandySurround(
                     content.inset(-edge * scale, -edge * scale)
                     if (!content.contains(event.rawX, event.rawY)) shellHandler.post { onExit() }
                 }
-                MotionEvent.ACTION_CANCEL -> if (gesture == 1) resize(event, true)
+                MotionEvent.ACTION_CANCEL -> if (gesture == 1) {
+                    val scale = lastResizeScale
+                    shellHandler.post { onResize(scale, true) }
+                }
             }
             return true
         }
