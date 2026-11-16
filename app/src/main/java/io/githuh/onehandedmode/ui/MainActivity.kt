@@ -20,6 +20,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -124,6 +125,7 @@ private fun HomeScreen(
     onAbout: () -> Unit,
     onHelp: () -> Unit,
 ) {
+    val context = LocalContext.current
     var mode by remember(preferences) { mutableIntStateOf(preferences?.getInt(HandySettings.MODE, 0) ?: 0) }
     var preset by remember(preferences) {
         mutableIntStateOf(preferences?.getInt(HandySettings.PRESET, HandySettings.DEFAULT_PERCENT) ?: HandySettings.DEFAULT_PERCENT)
@@ -164,7 +166,7 @@ private fun HomeScreen(
                     enabled = preferences != null,
                     onSelectedIndexChange = { index ->
                         mode = index
-                        preferences!!.edit().putInt(HandySettings.MODE, index).apply()
+                        HandySettings.saveScaleSetting(context, preferences!!, HandySettings.MODE, index)
                     },
                 )
             }
@@ -182,7 +184,7 @@ private fun HomeScreen(
                             enabled = preferences != null,
                             onClick = {
                                 preset = percent
-                                preferences!!.edit().putInt(HandySettings.PRESET, percent).apply()
+                                HandySettings.saveScaleSetting(context, preferences!!, HandySettings.PRESET, percent)
                             },
                         )
                     }
@@ -197,7 +199,7 @@ private fun HomeScreen(
                         enabled = preferences != null,
                         onValueChange = { custom = it.roundToInt() },
                         onValueChangeFinished = {
-                            preferences!!.edit().putInt(HandySettings.CUSTOM, custom).apply()
+                            HandySettings.saveScaleSetting(context, preferences!!, HandySettings.CUSTOM, custom)
                         },
                     )
                 }

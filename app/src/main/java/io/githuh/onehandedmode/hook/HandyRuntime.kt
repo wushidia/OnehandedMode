@@ -21,6 +21,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.SystemClock
 import android.provider.Settings
+import android.util.Log
 import android.view.Display
 import android.view.Choreographer
 import android.view.MotionEvent
@@ -28,6 +29,7 @@ import android.view.RoundedCorner
 import android.view.Surface
 import android.view.SurfaceControl
 import io.githuh.onehandedmode.HandySettings
+import io.githuh.onehandedmode.ScaleMemory
 import java.lang.reflect.Proxy
 import kotlin.math.roundToInt
 
@@ -51,7 +53,10 @@ internal class HandyRuntime(
     private val state: Int get() = stateField.getInt(null)
     private var right = true
     private var downX = screen.width / 2f
-    private var scale = HandySettings.scale(preferences)
+    private val scaleMemory = ScaleMemory(HandySettings.selection(preferences))
+    private var scale: Float
+        get() = scaleMemory.scale
+        set(value) { scaleMemory.preview(value) }
     private var exitPending = false
     private var resizePending = false
     private var restartAt = 0L
@@ -83,8 +88,8 @@ internal class HandyRuntime(
         "setFrameTimelineVsync", Long::class.javaPrimitiveType,
     )
     private val frameVsync = Choreographer::class.java.getDeclaredMethod("getVsyncId")
-    private val preferenceListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
-        handler.post { applySettings(key) }
+    private val preferenceListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+        handler.post { applySettings() }
     }
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -141,22 +146,20 @@ internal class HandyRuntime(
         handler.post { applySettings() }
     }
 
-    private fun applySettings(changedKey: String? = null) {
-        val sizeKey = if (preferences.getInt(HandySettings.MODE, HandySettings.PRESET_MODE) == HandySettings.CUSTOM_MODE)
-            HandySettings.CUSTOM else HandySettings.PRESET
-        // A drag owns the live size. Unrelated preference changes must not restore an older size.
-        if (!resizing && (changedKey == null || changedKey == HandySettings.MODE || changedKey == sizeKey)) {
-            val newScale = HandySettings.scale(preferences)
-            if (newScale != scale) {
-                scale = newScale
-                if (state == 2) {
-                    applyGeometry()
-                    overlay.update(scale, right)
-                } else if (state == 1) {
-                    resizePending = true
-                    restartAt = SystemClock.uptimeMillis() + 300L
-                    requestExit()
-                }
+    private fun applySettings() {
+        // Compare an atomic size snapshot rather than relying on a particular notification key.
+        // Unchanged saved data cannot restore an older size while a drag save is still in flight.
+        val saved = HandySettings.selection(preferences)
+        if (scaleMemory.synchronize(saved, dragging = resizing)) {
+            Log.i("OneHandedMode", "Scale settings applied: mode=${saved.mode}, percent=${saved.percent}")
+            pendingScale = scale
+            if (state == 2) {
+                applyGeometry()
+                overlay.update(scale, right)
+            } else if (state == 1) {
+                resizePending = true
+                restartAt = SystemClock.uptimeMillis() + 300L
+                requestExit()
             }
         }
         controller.write("mOffSetFraction", 1f - scale)
@@ -213,7 +216,12 @@ internal class HandyRuntime(
             RoundedCorner.POSITION_TOP_LEFT, RoundedCorner.POSITION_TOP_RIGHT,
             RoundedCorner.POSITION_BOTTOM_LEFT, RoundedCorner.POSITION_BOTTOM_RIGHT,
         ).minOf { display.getRoundedCorner(it)?.radius ?: 0 }.toFloat()
-        // Every entry route uses the live size, including while its save broadcast is in flight.
+        // Pick up settings even if their notification is queued/missed. ScaleMemory keeps the
+        // just-dragged live size when the saved snapshot still predates its asynchronous write.
+        val saved = HandySettings.selection(preferences)
+        scaleMemory.synchronize(saved)
+        pendingScale = scale
+        Log.i("OneHandedMode", "Scale entry: saved=${saved.percent}, live=${(scale * 100).roundToInt()}")
         controller.write("mOffSetFraction", 1f - scale)
         right = downX >= screen.width / 2f
         anchor = if (right) 1f else 0f
@@ -378,6 +386,7 @@ internal class HandyRuntime(
             controller.write("mOffSetFraction", 1f - scale)
             if (updateWindow) applyGeometry()
         }
+        val saved = scaleMemory.finishDrag(percent, HandySettings.scaleWriteStamp(context))
         // Saving is gesture completion work, not a frame callback that an exit can cancel.
         if (updateWindow) {
             overlay.update(scale, right)
@@ -385,7 +394,10 @@ internal class HandyRuntime(
         context.sendBroadcast(Intent(HandySettings.SAVE_SCALE_ACTION)
             .setClassName("io.githuh.onehandedmode", "io.githuh.onehandedmode.ScaleReceiver")
             .addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
-            .putExtra(HandySettings.CUSTOM, percent))
+            .putExtra(HandySettings.CUSTOM, saved.percent)
+            .putExtra(HandySettings.SCALE_CHANGE_ID, saved.changeId)
+            .putExtra(HandySettings.SCALE_CHANGE_BOOT, saved.stamp.boot)
+            .putExtra(HandySettings.SCALE_CHANGE_TIME, saved.stamp.time))
     }
 
     private fun applyGeometry(vsync: Long? = null) {

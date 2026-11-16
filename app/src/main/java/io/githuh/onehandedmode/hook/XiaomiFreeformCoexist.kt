@@ -1,5 +1,6 @@
 package io.githuh.onehandedmode.hook
 
+import android.annotation.SuppressLint
 import android.content.ContentResolver
 import android.graphics.Bitmap
 import android.provider.Settings
@@ -16,36 +17,47 @@ internal class XiaomiFreeformCoexist(
     private val loader: ClassLoader,
     private val runtime: () -> HandyRuntime,
 ) {
+    private val abi = XiaomiShellAbi.detect(loader) ?: error("Xiaomi shell settings owner not found")
     private val multitaskingSettingsRead = ThreadLocal<Boolean>()
     private val logicalInputDispatch = ThreadLocal<Boolean>()
     private val sidebarCoverInit = ThreadLocal<Boolean>()
 
+    // This adapter runs in the platform SystemUI process under LSPosed, not in the app.
+    @SuppressLint("BlockedPrivateApi")
     fun install(hasLinkageAnimation: Boolean) {
         // Resolve every required base target before mutating the process. An incomplete or
         // third-party Xiaomi package must not leave a partially installed adapter behind.
-        val settings = type("common.MultiTaskingSettingsObserver")
-        val changed = settings.getDeclaredMethod("onOneHandleModeChanged")
+        val settings = platformType(abi.settingsOwner)
+        val settingsCallbacks = platformType(abi.settingsCallbackOwner).declaredMethods
+        val changed = if (abi == XiaomiShellAbi.MULTITASKING) {
+            settings.getDeclaredMethod("onOneHandleModeChanged")
+        } else {
+            // HyperOS 1 reads the activation setting directly in this ContentObserver.
+            platformType(abi.settingsCallbackOwner).getDeclaredMethod(
+                "onChange", Boolean::class.javaPrimitiveType!!, android.net.Uri::class.java,
+            )
+        }
         val intType = Int::class.javaPrimitiveType!!
         val secureRead = Settings.Secure::class.java.getDeclaredMethod(
             "getIntForUser", ContentResolver::class.java, String::class.java, intType, intType,
         )
-        val settingsCallbacks = type("common.MultiTaskingSettingsObserver\$3").declaredMethods
-        val receiver = type("miuimultiwinswitch.miuiwindowdecor.MulWinSwitchEventController\$EventReceiver")
+        val receiver = platformType(abi.receiverOwner)
         val receive = receiver.getDeclaredMethod("onInputEvent", InputEvent::class.java)
+        val eventDisplay = InputEvent::class.java.getDeclaredMethod("getDisplayId")
         val floatType = Float::class.javaPrimitiveType!!
-        val exclusionQueries = listOf(
-            "miuifreeform.MiuiFreeformModeGestureHandler",
-            "miuimultiwinswitch.miuiwindowdecor.MulWinSwitchAnimStatus",
-        ).map { name ->
-            val owner = type(name)
-            owner.getDeclaredMethod("isInExcludeRegion", floatType, floatType)
+        val exclusionQueries = abi.exclusionOwners.map { name ->
+            platformType(name).getDeclaredMethod("isInExcludeRegion", floatType, floatType)
         }
-        val gestureHandler = type("miuifreeform.MiuiFreeformModeGestureHandler")
+        val gestureHandler = platformType(abi.gestureOwner)
+        val inputMonitor = Class.forName("android.view.InputMonitor")
         val handleMotionEvents = gestureHandler.getDeclaredMethod(
-            "handleMotionEvents", MotionEvent::class.java, Class.forName("android.view.InputMonitor"),
+            "handleMotionEvents", MotionEvent::class.java, inputMonitor,
         )
-        val switchEventHandlerMethods =
-            type("miuimultiwinswitch.miuiwindowdecor.MulWinSwitchEventHandler").declaredMethods
+        val switchEventHandlerMethods = platformType(abi.inputHandlerOwner).declaredMethods
+        val legacyTouchDispatch = if (abi == XiaomiShellAbi.LEGACY) {
+            platformType("com.android.wm.shell.miuifreeform.MiuiFreeformModeController")
+                .getDeclaredMethod("handleTouchEvent", MotionEvent::class.java, inputMonitor)
+        } else null
 
         module.deoptimize(changed)
         // This is the exact observer that reads the one-handed activation setting on this platform.
@@ -68,7 +80,8 @@ internal class XiaomiFreeformCoexist(
         module.deoptimize(receive)
         module.hook(receive).intercept { chain ->
             val event = chain.getArg(0)
-            if (event is MotionEvent && runtime().isOneHandedActive()) {
+            if (event is MotionEvent && eventDisplay.invoke(event) == android.view.Display.DEFAULT_DISPLAY &&
+                runtime().isOneHandedActive()) {
                 // Preserve the input sequence number: the original receiver finishes and recycles
                 // this private event after its handlers consume the transformed coordinates.
                 runtime().mapFreeformInput(event)
@@ -94,6 +107,7 @@ internal class XiaomiFreeformCoexist(
         }
         module.deoptimize(handleMotionEvents)
         switchEventHandlerMethods.forEach { module.deoptimize(it) }
+        legacyTouchDispatch?.let { module.deoptimize(it) }
 
         // Older multitasking shells have no linkage animation subsystem. A changed optional
         // animation API must not disable the already validated common settings/input adapter.
@@ -105,12 +119,13 @@ internal class XiaomiFreeformCoexist(
         module.log(
             Log.INFO,
             "OneHandedMode",
-            "Xiaomi freeform coexistence adapter installed, linkageAnimation=$linkageInstalled",
+            "Xiaomi freeform coexistence adapter installed, shell=$abi, linkageAnimation=$linkageInstalled",
         )
     }
 
     @Suppress("DEPRECATION")
     fun hasLinkageAnimation(): Boolean {
+        if (abi == XiaomiShellAbi.LEGACY) return false
         // Inspect the defining shell loader's existing dex files without loading an absent
         // class. This runs during background capability detection, before installing hooks.
         val shellLoader = type("common.MultiTaskingSettingsObserver").classLoader
@@ -170,16 +185,12 @@ internal class XiaomiFreeformCoexist(
         module.deoptimize(startSidebar)
     }
 
+    private fun platformType(name: String): Class<*> = Class.forName(name, false, loader)
+
     private fun type(name: String): Class<*> =
-        Class.forName("com.android.wm.shell.multitasking.$name", false, loader)
+        platformType("com.android.wm.shell.multitasking.$name")
 
     companion object {
-        fun isAvailable(loader: ClassLoader): Boolean = runCatching {
-            Class.forName(
-                "com.android.wm.shell.multitasking.common.MultiTaskingSettingsObserver",
-                false,
-                loader,
-            )
-        }.isSuccess
+        fun isAvailable(loader: ClassLoader): Boolean = XiaomiShellAbi.detect(loader) != null
     }
 }

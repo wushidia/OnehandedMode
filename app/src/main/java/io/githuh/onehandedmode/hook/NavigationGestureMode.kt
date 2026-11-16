@@ -27,6 +27,7 @@ internal class NavigationGestureMode(
     private val notifyingFlags = ThreadLocal<Long>()
     private val mirroredNotifications = ConcurrentHashMap<Int, Notification>()
     private val lastTransportStates = ConcurrentHashMap<Int, Int>()
+    private val deoptimizedCallbackTypes = ConcurrentHashMap.newKeySet<Class<*>>()
     private lateinit var preferenceListener: SharedPreferences.OnSharedPreferenceChangeListener
 
     fun install() {
@@ -45,16 +46,16 @@ internal class NavigationGestureMode(
             else notify.parameterTypes.indexOf(Long::class.javaPrimitiveType)
         val flagsType = notify.parameterTypes[flagsIndex]
         serviceType.declaredMethods.forEach { module.deoptimize(it) }
-        // Xiaomi R8 keeps this field's concrete type but removes the unused assignment.
-        // Deoptimize the class directly; the field's runtime value is therefore unnecessary.
-        serviceType.getDeclaredField("mSysUiStateCallback").type.declaredMethods
-            .filterNot { Modifier.isAbstract(it.modifiers) }
-            .forEach { module.deoptimize(it) }
+        // Some R8 builds retain a concrete callback field without assigning it; older
+        // HyperOS builds have no field and register a lambda directly in SysUiState instead.
+        deoptimizeCallbacks(serviceType)
         serviceType.declaredConstructors.forEach { constructor ->
             module.deoptimize(constructor)
             module.hook(constructor).intercept { chain ->
                 val result = chain.proceed()
-                proxyService = chain.thisObject!!
+                val service = chain.thisObject!!
+                proxyService = service
+                deoptimizeCallbacks(serviceType, service)
                 result
             }
         }
@@ -189,6 +190,21 @@ internal class NavigationGestureMode(
         }
         module.log(Log.INFO, "OneHandedMode", "Navigation transport attached: $descriptor, " +
             "longFlags=$longFlags, perDisplay=$perDisplay")
+    }
+
+    private fun deoptimizeCallbacks(serviceType: Class<*>, service: Any? = null) {
+        runCatching {
+            launcherStateCallbackTypes(serviceType, service).forEach { callbackType ->
+                if (deoptimizedCallbackTypes.add(callbackType)) {
+                    callbackType.declaredMethods.filterNot { Modifier.isAbstract(it.modifiers) }
+                        .forEach { module.deoptimize(it) }
+                    module.log(Log.INFO, "OneHandedMode", "Navigation state callback attached: ${callbackType.name}")
+                }
+            }
+        }.onFailure { error ->
+            // The notifier and Binder transport can still filter state without this optional optimization.
+            module.log(Log.WARN, "OneHandedMode", "Navigation callback deoptimization unavailable", error)
+        }
     }
 
     private fun type(name: String): Class<*> = Class.forName(name, false, loader)

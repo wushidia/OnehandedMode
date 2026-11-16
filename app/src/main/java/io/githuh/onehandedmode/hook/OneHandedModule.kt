@@ -238,9 +238,15 @@ class OneHandedModule : XposedModule() {
             result
         }
         log(Log.INFO, "OneHandedMode", "Hooks installed at framework and callback boundaries")
-        navigation.install(this, loader)
-        NavigationGestureMode(this, loader, preferences).install()
-        log(Log.INFO, "OneHandedMode", "Navigation gesture hooks installed")
+        // Optional navigation ABIs must not abort the remaining module initialization.
+        runCatching { navigation.install(this, loader) }.onFailure { error ->
+            log(Log.ERROR, "OneHandedMode", "Skipping navigation bar geometry adapter", error)
+        }
+        runCatching { NavigationGestureMode(this, loader, preferences).install() }
+            .onSuccess { log(Log.INFO, "OneHandedMode", "Navigation gesture hooks installed") }
+            .onFailure { error ->
+                log(Log.ERROR, "OneHandedMode", "Skipping navigation gesture adapter", error)
+            }
     }
 
     private fun installFreeformHooks(

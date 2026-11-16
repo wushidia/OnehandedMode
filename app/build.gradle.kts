@@ -10,8 +10,8 @@ android {
         applicationId = "io.githuh.onehandedmode"
         minSdk = 31
         targetSdk = 37
-        versionCode = 30
-        versionName = "1.0.20"
+        versionCode = 32
+        versionName = "1.0.22"
     }
     buildFeatures {
         compose = true
@@ -36,6 +36,7 @@ kotlin {
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
     compileOnly("io.github.libxposed:api:102.0.0")
     implementation("io.github.libxposed:service:102.0.0")
     implementation("androidx.activity:activity-compose:1.13.0")

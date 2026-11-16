@@ -33,13 +33,19 @@ class ModuleApplication : Application(), XposedServiceHelper.OnServiceListener {
         mainHandler.post { this.service = null }
     }
 
-    fun saveScale(percent: Int, onSaved: () -> Unit) {
+    internal fun saveScale(percent: Int, changeId: String, stamp: ScaleWriteStamp, onSaved: () -> Unit) {
         val save = {
-            service!!.getRemotePreferences(HandySettings.GROUP).edit()
-                .putInt(HandySettings.CUSTOM, percent)
-                .putInt(HandySettings.MODE, HandySettings.CUSTOM_MODE)
-                // Finish the remote write before releasing the broadcast's pending result.
-                .commit()
+            val preferences = service!!.getRemotePreferences(HandySettings.GROUP)
+            if (stamp.canReplace(HandySettings.selection(preferences).stamp)) {
+                preferences.edit()
+                    .putInt(HandySettings.CUSTOM, percent)
+                    .putInt(HandySettings.MODE, HandySettings.CUSTOM_MODE)
+                    .putString(HandySettings.SCALE_CHANGE_ID, changeId)
+                    .putInt(HandySettings.SCALE_CHANGE_BOOT, stamp.boot)
+                    .putLong(HandySettings.SCALE_CHANGE_TIME, stamp.time)
+                    // Finish the remote write before releasing the broadcast's pending result.
+                    .commit()
+            }
             onSaved()
         }
         if (service != null) save() else pendingScales.add(save)
